@@ -6,14 +6,16 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 PROJECT_NAME = "microcloud-test"
+PROFILE_NAME = "microcloud-profile"
 DEFAULT_MICROCLOUD_SNAP_PATH = "/home/gab/go/src/github.com/microcloud-pkg-snap"
 DEFAULT_CACHE_PATH = os.getcwd() + "/.cache"
 VMS = {
     f"micro{i}": {
         "config": (
-            {"limits.cpu": "2", "limits.memory": "2GiB"},
+            {"limits.cpu": "2", "limits.memory": "2GiB", "migration.stateful": "true"},
             f"local{i}+remote{i}" if i < 4 else f"local{i}",
         ),
         "desired_status": "RUNNING" if i < 4 else "STOPPED",
@@ -32,16 +34,28 @@ NETWORKS = ["microbr0"]
 SNAPSHOT_BASE_NAME = "microcloud-base-snapshot"
 
 
-def create_disk(disk_name: str, conf: tuple(str, str)):
-        size = ""
-        if conf[1] != "":
-            size = f"size={conf[1]}"
+def create_profile():
+    try:
+        subprocess.run(["lxc", "profile", "copy", "default", PROFILE_NAME, "--target-project", PROJECT_NAME], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error copying default profile to {PROFILE_NAME}: {e}")
+        sys.exit(1)
 
-        try:
-            subprocess.run(["lxc", "storage", "volume", "create", "disks", disk_name, "--type", "block", size, "--project", PROJECT_NAME], check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Error creating disk {disk_name}: {e}")
-            sys.exit(1)
+
+def create_disk(disk_name: str, size: str):
+        if size != "":
+            size = f"size={size}"
+            try:
+                subprocess.run(["lxc", "storage", "volume", "create", "disks", disk_name, "--type", "block", size, "--project", PROJECT_NAME], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error creating disk {disk_name}: {e}")
+                sys.exit(1)
+        else:
+            try:
+                subprocess.run(["lxc", "storage", "volume", "create", "disks", disk_name, "--type", "block", "--project", PROJECT_NAME], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error creating disk {disk_name}: {e}")
+                sys.exit(1)
 
 
 def remove_disk(disk_name: str):
@@ -52,13 +66,13 @@ def remove_disk(disk_name: str):
         sys.exit(1)
 
 
-def init_vm(vm_name: str, conf: tuple(str, str)):
+def init_vm(vm_name: str, conf):
     config = []
     for key, value in conf.items():
         config.append("--config")
         config.append(f"{key}={value}")
 
-    cmd_create = ["lxc", "init", "ubuntu:22.04", vm_name, "--vm"]
+    cmd_create = ["lxc", "init", "ubuntu:22.04", vm_name, "--profile", PROFILE_NAME, "--vm"]
     cmd_create.extend(config)
     cmd_create.extend(["--project", PROJECT_NAME])
 
@@ -95,6 +109,26 @@ def start_vm(vm_name: str):
     except subprocess.CalledProcessError as e:
         print(f"Error starting VM {vm_name}: {e}")
         sys.exit(1)
+
+
+def delete_image(fingerprint: str):
+    try:
+        subprocess.run(["lxc", "image", "delete", fingerprint, "--project", PROJECT_NAME], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error deleting image {fingerprint}: {e}")
+        sys.exit(1)
+
+
+def delete_images():
+    try:
+        res = subprocess.run(["lxc", "image", "list", "--project", PROJECT_NAME, "-c", "f", "-f", "csv"], check=True, stdout=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        print(f"Error listing images: {e}")
+        sys.exit(1)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(create_disk, delete_image, fingerprint) for fingerprint in res.stdout.decode("utf-8").strip().splitlines()]
+        concurrent.futures.wait(futures)
 
 
 def delete_vm(vm_name: str):
@@ -173,6 +207,7 @@ def purge_cache(cache_path):
 
 def setup_infra(cache_path: str, args: dict):
     # Create the microcloud project.
+    print(f"Creating {PROJECT_NAME} project...")
     try:
         subprocess.run(["lxc", "project", "create", PROJECT_NAME], check=True)
     except subprocess.CalledProcessError as e:
@@ -202,6 +237,9 @@ def setup_infra(cache_path: str, args: dict):
 
 
     if not cache_populated(cache_path):
+        # Before initializing the VMs, we need to copy the default project settings to PROJECT_NAME project.
+        create_profile()
+
         # Init the VMs.
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [executor.submit(init_vm, vm_name, vm_data["config"][0]) for vm_name, vm_data in VMS.items()]
@@ -215,6 +253,9 @@ def setup_infra(cache_path: str, args: dict):
         if args["--purge-cache"]:
             # Purge the cache.
             purge_cache(cache_path)
+
+            # Same thing as above.
+            create_profile()
 
             # Init the VMs.
             with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -231,24 +272,44 @@ def setup_infra(cache_path: str, args: dict):
                 concurrent.futures.wait(futures)
 
     # Attach disks (local and remote ones) to the VMs.
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(attach_disk_to_vm, vm_name, disk)
-            for vm_name, vm_data in VMS.items()
-            for disk in vm_data["config"][1].split("+")
-        ]
-        concurrent.futures.wait(futures)
+    for vm_name, vm_data in VMS.items():
+        for disk in vm_data["config"][1].split("+"):
+            attach_disk_to_vm(vm_name, disk)
 
     # Add network interfaces to the VMs.
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(add_network_interface_to_vm, vm_name, "eth1") for vm_name in VMS.keys()]
         concurrent.futures.wait(futures)
 
-
     # Start VMs.
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(start_vm, vm_name) for vm_name in VMS.keys()]
         concurrent.futures.wait(futures)
+
+    # Wait for all the VMs to be ready.
+    print("Waiting for VMs to be ready...")
+    vms_ready = []
+    while True:
+        vms_status = get_vms_status()
+        if len(vms_status.splitlines()) != len(VMS):
+            time.sleep(2)
+            continue
+
+        for line in vms_status.splitlines():
+            parts = line.split(",")
+            if len(parts) >= 2:
+                vm_name, status, ipv4_with_iface = parts[0], parts[1], parts[2]
+                if vm_name in VMS.keys() and status == "RUNNING" and is_valid_ipv4(ipv4_with_iface.split(" ")[0]):
+                    if vm_name not in vms_ready:
+                        vms_ready.append(vm_name)
+                        print(f"VM {vm_name} is ready")
+            else:
+                break
+
+        if len(vms_ready) == len(VMS):
+            break
+
+        time.sleep(2)
 
 
 def configure_vm(vm_name: str):
@@ -269,11 +330,21 @@ def configure_vm(vm_name: str):
 
     # Install the required snap packages (except microcloud that we want to side load)
     try:
-        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "lxd"], check=True)
-        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "microceph"], check=True)
-        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "microovn"], check=True)
+        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install lxd", shell=True).wait()
     except subprocess.CalledProcessError as e:
-        print(f"Error installing snap packages for {vm_name}: {e}")
+        print(f"Error installing lxd snap packages for {vm_name}: {e}")
+        sys.exit(1)
+
+    try:
+        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install microceph", shell=True).wait()
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing microceph snap packages for {vm_name}: {e}")
+        sys.exit(1)
+
+    try:
+        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install microovn", shell=True).wait()
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing microovn snap packages for {vm_name}: {e}")
         sys.exit(1)
 
 
@@ -318,6 +389,10 @@ def existing_microcloud_infra():
     print("Inspecting machines...")
 
     vms_status = get_vms_status()
+    if len(vms_status.splitlines()) != len(VMS):
+        print(f"Expected {len(VMS)} VMs but found {len(vms_status.splitlines())}")
+        return False
+
     for line in vms_status.splitlines():
         parts = line.split(",")
         if len(parts) >= 2:
@@ -369,6 +444,16 @@ def purge_microcloud_infra():
         except subprocess.CalledProcessError as e:
             print(f"Error deleting {network} network: {e}")
             sys.exit(1)
+
+    print("Deleting profile...")
+    try:
+        subprocess.run(["lxc", "profile", "delete", PROFILE_NAME, "--project", PROJECT_NAME], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error deleting {PROFILE_NAME} profile: {e}")
+        sys.exit(1)
+
+    print("Deleting images...")
+    delete_images()
 
     print("Deleting project...")
     try:
