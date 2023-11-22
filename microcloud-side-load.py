@@ -139,7 +139,7 @@ def delete_images():
         raise e
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(create_disk, delete_image, fingerprint) for fingerprint in res.stdout.decode("utf-8").strip().splitlines()]
+        futures = [executor.submit(delete_image, fingerprint) for fingerprint in res.stdout.decode("utf-8").strip().splitlines()]
         concurrent.futures.wait(futures)
 
 
@@ -201,13 +201,13 @@ def cache_populated(cache_path):
     if not os.path.isdir(cache_path):
         return False
 
-    return os.listdir(cache_path) == [f"{vm_name}.tar.gz" for vm_name in VMS.keys()]
+    return sorted(os.listdir(cache_path)) == sorted([f"{vm_name}.tar.gz" for vm_name in VMS.keys()])
 
 
 def purge_cache(cache_path):
     if not os.path.exists(cache_path):
         print("Folder does not exist:", cache_path)
-        sys.exit(1)
+        raise FileNotFoundError
 
     for item_name in os.listdir(cache_path):
         item_path = os.path.join(cache_path, item_name)
@@ -216,6 +216,32 @@ def purge_cache(cache_path):
             os.remove(item_path)
         elif os.path.isdir(item_path):
             shutil.rmtree(item_path)
+
+
+def wait_for_vms_ready():
+    vms_ready = []
+    while True:
+        vms_status = get_vms_status()
+        if len(vms_status.splitlines()) != len(VMS):
+            time.sleep(2)
+            continue
+
+        for line in vms_status.splitlines():
+            parts = line.split(",")
+            if len(parts) >= 2:
+                vm_name, status, ipv4_with_iface = parts[0], parts[1], parts[2]
+                if vm_name in VMS.keys() and status == "RUNNING" and is_valid_ipv4(ipv4_with_iface.split(" ")[0]):
+                    if vm_name not in vms_ready:
+                        vms_ready.append(vm_name)
+                        print(f"VM {vm_name} is ready")
+            else:
+                break
+
+        if len(vms_ready) == len(VMS):
+            time.sleep(20) # Before leaving, wait for the VM agents to be ready
+            break
+
+        time.sleep(2)
 
 
 def setup_infra(cache_path: str, args: dict):
@@ -248,10 +274,20 @@ def setup_infra(cache_path: str, args: dict):
             print(f"Error creating {network} network: {e}")
             raise e
 
+    # Before initializing the VMs, we need to copy the default project settings to PROJECT_NAME project.
+    create_profile()
 
-    if not cache_populated(cache_path):
-        # Before initializing the VMs, we need to copy the default project settings to PROJECT_NAME project.
-        create_profile()
+    if cache_populated(cache_path) and not args["--purge-cache"]:
+        # Restore the VMs from the cache (restoring should also attach disks and add network interfaces to the VMs)
+        print("Restoring VMs from cache...")
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(restore_vm_from_cache, vm_name, cache_path) for vm_name in VMS.keys()]
+            concurrent.futures.wait(futures)
+    else:
+        if args["--purge-cache"]:
+            # Purge the cache.
+            print("Purging cache...")
+            purge_cache(cache_path)
 
         # Init the VMs.
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -262,37 +298,15 @@ def setup_infra(cache_path: str, args: dict):
         for vm in VMS.values():
             vm["new"] = True
 
-    else:
-        if args["--purge-cache"]:
-            # Purge the cache.
-            purge_cache(cache_path)
+        # Attach disks (local and remote ones) to the VMs.
+        for vm_name, vm_data in VMS.items():
+            for disk in vm_data["config"][1].split("+"):
+                attach_disk_to_vm(vm_name, disk)
 
-            # Same thing as above.
-            create_profile()
-
-            # Init the VMs.
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(init_vm, vm_name, vm_data["config"][0]) for vm_name, vm_data in VMS.items()]
-                concurrent.futures.wait(futures)
-
-            # Mark VMs as new.
-            for vm in VMS.values():
-                vm["new"] = True
-        else:
-            # Restore the VMs from the cache.
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(restore_vm_from_cache, vm_name, cache_path) for vm_name in VMS.keys()]
-                concurrent.futures.wait(futures)
-
-    # Attach disks (local and remote ones) to the VMs.
-    for vm_name, vm_data in VMS.items():
-        for disk in vm_data["config"][1].split("+"):
-            attach_disk_to_vm(vm_name, disk)
-
-    # Add network interfaces to the VMs.
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(add_network_interface_to_vm, vm_name, "eth1") for vm_name in VMS.keys()]
-        concurrent.futures.wait(futures)
+        # Add network interfaces to the VMs.
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(add_network_interface_to_vm, vm_name, "eth1") for vm_name in VMS.keys()]
+            concurrent.futures.wait(futures)
 
     # Start VMs.
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -301,31 +315,10 @@ def setup_infra(cache_path: str, args: dict):
 
     # Wait for all the VMs to be ready.
     print("Waiting for VMs to be ready...")
-    vms_ready = []
-    while True:
-        vms_status = get_vms_status()
-        if len(vms_status.splitlines()) != len(VMS):
-            time.sleep(2)
-            continue
-
-        for line in vms_status.splitlines():
-            parts = line.split(",")
-            if len(parts) >= 2:
-                vm_name, status, ipv4_with_iface = parts[0], parts[1], parts[2]
-                if vm_name in VMS.keys() and status == "RUNNING" and is_valid_ipv4(ipv4_with_iface.split(" ")[0]):
-                    if vm_name not in vms_ready:
-                        vms_ready.append(vm_name)
-                        print(f"VM {vm_name} is ready")
-            else:
-                break
-
-        if len(vms_ready) == len(VMS):
-            break
-
-        time.sleep(2)
+    wait_for_vms_ready()
 
 
-def configure_vm(vm_name: str):
+def enable_ovn_net_iface(vm_name: str):
     # Configure the network interface connected to microbr0 to not accept any IP addresses (because MicroCloud
     # requires a network interface that doesn’t have an IP address assigned)
     try:
@@ -341,22 +334,23 @@ def configure_vm(vm_name: str):
         print(f"Error bringing network interface up for {vm_name}: {e}")
         raise e
 
+
+def install_snap_deps(vm_name: str):
     # Install the required snap packages (except microcloud that we want to side load)
-    time.sleep(10) # Wait for snapd to be ready
     try:
-        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install lxd", shell=True).wait()
+        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "lxd"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error installing lxd snap packages for {vm_name}: {e}")
         raise e
 
     try:
-        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install microceph", shell=True).wait()
+        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "microceph"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error installing microceph snap packages for {vm_name}: {e}")
         raise e
 
     try:
-        subprocess.Popen(f"lxc exec {vm_name} --project {PROJECT_NAME} -- snap install microovn", shell=True).wait()
+        subprocess.run(["lxc", "exec", vm_name, "--project", PROJECT_NAME, "--", "snap", "install", "microovn"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error installing microovn snap packages for {vm_name}: {e}")
         raise e
@@ -382,10 +376,16 @@ def export_vm_to_cache(vm_name: str, cache_path: str):
         print(f"VM {vm_name} already exists in the cache")
 
 
-def setup_vms(cache_path: str):
-    # Configure the VMs.
+def full_vms_setup(cache_path: str):
+    # Enable OVN net interface on the VMs.
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(configure_vm, vm_name) for vm_name in VMS.keys()]
+        futures = [executor.submit(enable_ovn_net_iface, vm_name) for vm_name in VMS.keys()]
+        concurrent.futures.wait(futures)
+
+    # Install external snap deps on the VMs.
+    time.sleep(10) # Wait for snapd to be ready
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(install_snap_deps, vm_name) for vm_name in VMS.keys()]
         concurrent.futures.wait(futures)
 
     # Snapshot the VMs.
@@ -427,7 +427,7 @@ def existing_microcloud_infra():
                     else:
                         print(f"VM {vm_name} has IP address {ip}")
 
-    print("All machines are in the expected state")
+    print("MicroCloud infrastructure detected: all machines are in the expected state")
     return True
 
 
@@ -511,12 +511,14 @@ def restore_local_snapshots():
         futures = [executor.submit(restore_vm_from_local_snapshot, vm_name) for vm_name in VMS.keys()]
         concurrent.futures.wait(futures)
 
+    time.sleep(5)
+
 
 def side_load_microcloud_snap():
     # Check local microccloud-pkg-snap folder
     if not os.path.exists(DEFAULT_MICROCLOUD_SNAP_PATH):
         print(f"Error: {DEFAULT_MICROCLOUD_SNAP_PATH} does not exist")
-        sys.exit(1)
+        raise FileNotFoundError
 
     snap_files = []
     for filename in os.listdir(DEFAULT_MICROCLOUD_SNAP_PATH):
@@ -541,7 +543,7 @@ def side_load_microcloud_snap():
 
     if len(snap_files) > 1 or len(snap_files) == 0:
         print(f"Error: Wrong number of .snap files in {DEFAULT_MICROCLOUD_SNAP_PATH}.")
-        sys.exit(1)
+        raise FileNotFoundError
     else:
         snap_file = snap_files[0]
         print(f"Found snap file in microcloud-pkg-snap folder: {snap_file}. Using it for side-loading.")
@@ -569,6 +571,8 @@ def main():
         "--microcloud-snap": None,
         # Whether to initialize the microcloud before starting side loading any snap in the VMs.
         "--init": False,
+        # Just purge the microcloud infrastructure and exit.
+        "--nuke": False,
     }
 
     # No parameters means you have existing VMs with the right devices and you want to reset the snaps inside them and load the new ones.
@@ -577,7 +581,7 @@ def main():
     it = iter(sys.argv[1:])
     for arg in it:
         if arg in args:
-            if arg == "--purge" or arg == "--purge-cache" or arg == "--init":
+            if arg == "--nuke" or arg == "--purge-cache" or arg == "--init":
                 args[arg] = True
             else:
                 try:
@@ -589,6 +593,11 @@ def main():
             print(f"Error: Unknown argument {arg}")
             sys.exit(1)
 
+    if args["--nuke"]:
+        # Purge the microcloud infrastructure and exit.
+        purge_microcloud_infra()
+        sys.exit(0)
+
     cache_path = args["--cache"] if args["--cache"] else DEFAULT_CACHE_PATH
     try:
         if existing_microcloud_infra():
@@ -597,14 +606,33 @@ def main():
                 setup_infra(cache_path, args)
 
             if vms_snapshotted():
+                # Start the last VM (micro4 in our case) before restoring it
+                try:
+                    subprocess.run(["lxc", "start", f"micro{len(VMS)}", "--project", PROJECT_NAME])
+                except subprocess.CalledProcessError as e:
+                    print(f"Error starting micro{len(VMS)} VM: {e}")
+                    raise e
+
+                wait_for_vms_ready()
+                print("VMs are already snapshotted. Restoring them from local snapshots...")
                 restore_local_snapshots()
+                wait_for_vms_ready()
+
+                # We still need to enable the OVN net interface on the VMs.
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [executor.submit(enable_ovn_net_iface, vm_name) for vm_name in VMS.keys()]
+                    concurrent.futures.wait(futures)
             else:
-                setup_vms(cache_path)
+                full_vms_setup(cache_path)
         else:
             setup_infra(cache_path, args)
             if all([vm["new"] for vm in VMS.values()]): # all VMs are new (i.e. they were just created from scratch without the cache)
-                setup_vms(cache_path)
+                full_vms_setup(cache_path)
             else:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [executor.submit(enable_ovn_net_iface, vm_name) for vm_name in VMS.keys()]
+                    concurrent.futures.wait(futures)
+
                 if not vms_snapshotted():
                     # Snapshot the VMs.
                     with concurrent.futures.ThreadPoolExecutor() as executor:
