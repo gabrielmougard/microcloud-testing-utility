@@ -1,4 +1,4 @@
-#!/bin/sh -eu
+#!/bin/bash -eu
 
 # This script is a modified version of this: https://github.com/canonical/microcloud/blob/main/microcloud/test/main.sh
 
@@ -68,7 +68,9 @@ export SNAPSHOT_RESTORE
 
 set +u
 if [ -z "${MICROCLOUD_SNAP_PATH}" ] || ! [ -e "${MICROCLOUD_SNAP_PATH}" ]; then
-  MICROCLOUD_SNAP_PATH=""
+    # Update the value of MICROCLOUD_SNAP_PATH to the path of the compiled snap
+    MICROCLOUD_SNAP_FOLDER="/home/gab/go/src/github.com/microcloud-pkg-snap"
+    MICROCLOUD_SNAP_PATH=$(find "${MICROCLOUD_SNAP_FOLDER}" -name "*.snap")
 fi
 set -u
 
@@ -76,7 +78,7 @@ export MICROCLOUD_SNAP_PATH
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --setup-infra)
+        --setup)
             # Create 4 nodes with 3 disks and 3 extra interfaces.
             new_systems 4 3 3
             shift
